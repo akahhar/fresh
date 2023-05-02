@@ -1,0 +1,255 @@
+<?php
+defined('BASEPATH') or exit('No direct script access allowed');
+class Pespal extends Admin_Controller
+{
+    public function __construct()
+    {
+        parent::__construct();
+        require_once(module_direcoty(PESPAL_MODULE, 'third_party/OAuth.php'));
+        $this->load->model('invoice_model');
+        $this->gateway_name = 'pespal';
+        $pespal_status = config_item('pespal_status');
+        if($pespal_status == 'active'){
+        $this->consumer_key = config_item('pespal_consumer_key');
+        //print('<pre>'.print_r($this->consumer_key,true).'</pre>'); //exit;
+        $this->consumer_secret = config_item('pespal_consumer_secret');
+        //print('<pre>'.print_r($this->consumer_secret,true).'</pre>'); exit;
+
+        }else{
+            $client_id = $this->session->userdata('client_id');
+            if (!empty($client_id)) {
+                redirect('client/dashboard');
+            } else {
+                redirect('admin/dashboard');
+            }
+        }
+        $this->test_mode = config_item('pespal_test_mode');
+        $this->callback_url = base_url() . $this->gateway_name . '/callback';
+    }
+
+
+    public function pay($invoice_id)
+    {
+        if (isset($invoice_id)) {
+            $invoice_info = $this->invoice_model->check_by(array('invoices_id' => $invoice_id), 'tbl_invoices');
+        } else {
+            exit('Invoice ID is not set');
+        }
+        // print('<pre>' . print_r($invoice_id, true) . '</pre>'); exit;
+        $data['breadcrumbs'] = lang('paystack');
+        $data['title'] = lang('make_payment');
+        $invoice_due = $this->invoice_model->calculate_to('invoice_due', $invoice_id);
+        if ($invoice_due <= 0) {
+            $invoice_due = 0.00;
+        }
+
+        $data['invoice_info'] = array(
+            'item_name' => $invoice_info->reference_no,
+            'item_number' => $invoice_id,
+            'currency' => $invoice_info->currency,
+            'amount' => $invoice_due
+        );
+
+        $this->load->library('form_validation');
+        $this->form_validation->set_error_delimiters('<div>', '</div>');
+        $this->form_validation->set_rules('reference_no', lang('reference_no'), 'trim|required');
+        $this->form_validation->set_rules('amount', lang('amount'), 'trim|required|callback_check_amount[' . $invoice_due . ']');
+        if ($this->form_validation->run() == true) {
+            $client_info = get_row('tbl_client', array('client_id' => $invoice_info->client_id));
+            $allow_customer_edit_amount = config_item('allow_customer_edit_amount');
+
+            if (!empty($allow_customer_edit_amount) && $allow_customer_edit_amount == 'No') {
+                $InvoiceValue = $invoice_due;
+            } else {
+                $InvoiceValue = $this->input->post('amount');
+            }
+
+            if (!empty($InvoiceValue)) {
+                $to_data['invoice_id'] = $invoice_id;
+                $to_data['email'] = $client_info->email;
+                $to_data['amount'] = $InvoiceValue;
+                return  $this->initialize($to_data);
+                exit;
+                // $msg = str_replace('"', '', $tranx->message);
+                // set_message('error', 'API returned error: ' . $msg); //exit;
+            }
+        }
+
+        if (!empty(validation_errors())) {
+            $type = "error";
+            $msg  = '';
+            foreach ($this->input->post() as $k => $v) {
+                $msg  .= form_error($k, '', '</br>');
+            }
+            if (empty($msg)) {
+                $msg  = 'something wrong';
+            }
+            set_message($type, $msg);
+        }
+
+        $data['url'] = '';
+        $data['subview'] = $this->load->view('pay', $data, true);
+        $this->load->view('client/_layout_main', $data);
+    }
+
+
+    public function check_amount($paid_amount, $due)
+    {
+        if ($paid_amount <= 0) {
+            $this->form_validation->set_message('check_amount', lang('amount_not_zero_neg'));
+            return false;
+        }
+        if ($paid_amount > $due) {
+            $this->form_validation->set_message('check_amount', lang('overpaid_amount'));
+            return false;
+        }
+        return true;
+    }
+
+    public function initialize($to_data = array())
+    // public function initialize()
+    {
+
+        if (!empty($to_data['amount'])) {
+
+            $token = $params = NULL;
+            $signature_method = new OAuthSignatureMethod_HMAC_SHA1();
+            if(!empty($this->test_mode)){
+            $iframelink = 'https://demo.pesapal.com/api/PostPesapalDirectOrderV4';
+            }else{
+            $iframelink = 'https://www.pesapal.com/API/PostPesapalDirectOrderV4';
+            }
+
+            $amount = number_format($to_data['amount'], 2); //format amount to 2 decimal places
+            $desc = '';
+            $type = 'MERCHANT'; //default value = MERCHANT
+            $reference = $to_data['invoice_id']; //unique order id of the transaction, generated by merchant
+            $first_name = 'First Name'; //[optional]
+            $last_name = 'Last Name'; //[optional]
+            $email = $to_data['email'];;
+            $phonenumber = ''; //ONE of email or phonenumber is required
+
+            $email =  $to_data['email'];
+            $amount =  $to_data['amount'];
+            $invoice_id =  $to_data['invoice_id'];
+            $callback_url = $this->callback_url . '/' . $invoice_id;
+
+            $post_xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?><PesapalDirectOrderInfo xmlns:xsi=\"http://www.w3.org/2001/XMLSchemainstance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" Amount=\"" . $amount . "\" Description=\"" . $desc . "\" Type=\"" . $type . "\" Reference=\"" . $reference . "\" FirstName=\"" . $first_name . "\" LastName=\"" . $last_name . "\" Email=\"" . $email . "\" PhoneNumber=\"" . $phonenumber . "\" xmlns=\"http://www.pesapal.com\" />";
+            $post_xml = htmlentities($post_xml);
+
+            $consumer = new OAuthConsumer($this->consumer_key, $this->consumer_secret);
+            //post transaction to pesapal
+            $iframe_src = OAuthRequest::from_consumer_and_token(
+                $consumer,
+                $token,
+                "GET",
+                $iframelink,
+                $params
+            );
+            $iframe_src->set_parameter("oauth_callback", $callback_url);
+            $iframe_src->set_parameter("pesapal_request_data", $post_xml);
+            $iframe_src->sign_request($signature_method, $consumer, $token);
+            //print('<pre>'.print_r($iframe_src, true).'</pre>'); exit;
+            $data['iframe_src'] = $iframe_src;
+            $data['subview'] = $this->load->view('pespal_iframe', $data, true);
+            $this->load->view('client/_layout_main', $data);
+        }
+    }
+
+
+    public function callback($invoices_id)
+    {
+        $pesapalNotification=$_GET['pesapal_notification_type'];
+        $pesapalTrackingId=$_GET['pesapal_transaction_tracking_id'];
+        $pesapal_merchant_reference=$_GET['pesapal_merchant_reference'];
+
+
+        if (!isset($_GET['pesapal_transaction_tracking_id'])) {
+                set_message('error', lang('cancelled_payment'));
+                redirect($this->gateway_name.'/pay/' . $invoices_id);
+            } elseif($pesapalNotification=="CHANGE" && $pesapalTrackingId!='')
+            {
+                $pesapal_tracking_id = $_GET['pesapal_transaction_tracking_id'];
+                $txid = $pesapal_tracking_id;
+                $token = $params = NULL;
+                $consumer = new OAuthConsumer($this->consumer_key, $this->consumer_secret);
+                $signature_method = new OAuthSignatureMethod_HMAC_SHA1();
+                if(!empty($this->test_mode)){
+                $statusrequestAPI = 'http://demo.pesapal.com/api/querypaymentstatus';
+                }else{
+                $statusrequestAPI = 'https://www.pesapal.com/api/querypaymentstatus';
+                }
+
+                //get transaction status
+                $request_status = OAuthRequest::from_consumer_and_token($consumer, $token, "GET", $statusrequestAPI, $params);
+                $request_status->set_parameter("pesapal_merchant_reference", $pesapal_merchant_reference);
+                $request_status->set_parameter("pesapal_transaction_tracking_id",$pesapalTrackingId);
+                $request_status->sign_request($signature_method, $consumer, $token);
+
+                $ch = curl_init();
+                curl_setopt($ch, CURLOPT_URL, $request_status);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+                curl_setopt($ch, CURLOPT_HEADER, 1);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+                if(defined('CURL_PROXY_REQUIRED')) if (CURL_PROXY_REQUIRED == 'True')
+                {
+                   $proxy_tunnel_flag = (defined('CURL_PROXY_TUNNEL_FLAG') && strtoupper(CURL_PROXY_TUNNEL_FLAG) == 'FALSE') ? false : true;
+                   curl_setopt ($ch, CURLOPT_HTTPPROXYTUNNEL, $proxy_tunnel_flag);
+                   curl_setopt ($ch, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+                   curl_setopt ($ch, CURLOPT_PROXY, CURL_PROXY_SERVER_DETAILS);
+                }
+
+                $response = curl_exec($ch);
+                $err = curl_error($ch);
+
+                $header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                $raw_header  = substr($response, 0, $header_size - 4);
+                $headerArray = explode("\r\n\r\n", $raw_header);
+                $header      = $headerArray[count($headerArray) - 1];
+
+                //transaction status
+                $tranx = preg_split("/=/",substr($response, $header_size));
+                $status = $tranx[1];
+                curl_close ($ch);
+
+                if ($err) {
+                    // there was an error contacting the Paystack API
+                    $msg = 'Curl returned error: ' . $err;
+                    set_message('error', $msg);
+                    redirect($this->gateway_name.'/pay/' . $invoices_id);
+                }
+                $tranx = json_decode($response);
+
+                if (!$status) {
+                    $msg = 'API returned error: ' . $tranx->message;
+                    set_message('error', $msg);
+                    redirect($this->gateway_name.'/pay/' . $invoices_id);
+                }
+                if ('success' == $status) {
+                    $amount = $tranx->data->amount;
+                    $trans_id = $tranx->data->id;
+                    $reference = $tranx->data->tx_ref;
+                    $currency = $tranx->data->currency;
+                    $this->addPayment($invoices_id, $amount, $trans_id, $this->gateway_name);
+                }
+            }
+    }
+
+
+    public function addPayment($invoices_id, $amount, $trans_id = null, $gateway = null)
+    {
+        $this->load->model('payments_model');
+        $result = $this->payments_model->addPayment($invoices_id, $amount, $trans_id, $this->gateway_name);
+        if ($result['type'] == 'success') {
+            set_message($result['type'], $result['message']);
+        } else {
+            set_message($result['type'], $result['message']);
+        }
+        $client_id = $this->session->userdata('client_id');
+        if (!empty($client_id)) {
+            redirect('client/dashboard');
+        } else {
+            redirect('frontend/view_invoice/' . url_encode($invoices_id));
+        }
+    }
+}
